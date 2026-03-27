@@ -144,12 +144,15 @@ async def task_command(
             ephemeral=True,
         )
 
-    # 创建独立线程进行交互
-    thread_name = f"🤖 {prompt[:15]}..." if len(prompt) > 15 else f"🤖 {prompt}"
-    thread = await interaction.channel.create_thread(
-        name=thread_name,
-        type=discord.ChannelType.public_thread,
-    )
+    # 如果当前 channel 已经是 Thread，直接使用；否则创建新线程
+    if isinstance(interaction.channel, discord.Thread):
+        thread = interaction.channel
+    else:
+        thread_name = f"🤖 {prompt[:15]}..." if len(prompt) > 15 else f"🤖 {prompt}"
+        thread = await interaction.channel.create_thread(
+            name=thread_name,
+            type=discord.ChannelType.public_thread,
+        )
 
     # 创建并发送初始状态面板
     dashboard = TaskDashboard(interaction, prompt)
