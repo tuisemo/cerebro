@@ -1,7 +1,7 @@
 [project]
-name = "facorty-droid-bot"
-version = "0.1.0"
-description = "Factory Droid x Discord 智能协同引擎"
+name = "cerebro"
+version = "2.0.0"
+description = "Cerebro — 群体智能协同引擎"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -10,4 +10,4 @@ dependencies = [
 ]
 
 [project.scripts]
-droid-discord = "main:main"
+cerebro = "cerebro.app:main"

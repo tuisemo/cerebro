@@ -18,6 +18,7 @@ wheels/
 # Droid workspaces (git clones for each thread)
 droid_workspaces/
 
-# Logs
+# Persistence and Logs
+droid_tasks.db
 *.log
 
