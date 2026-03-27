@@ -21,7 +21,7 @@ from .runner import DroidTask
 from .workspace import WorkspaceManager, WorkspaceError
 from .ui import TaskDashboard
 from .handler import DroidEventHandler
-from .registry import TaskRegistry
+from .registry import TaskRegistry, STATUS_COMPLETED
 from .parser import parse_task_command, format_task_preview
 
 
@@ -140,7 +140,12 @@ async def _execute(thread: discord.Thread, prompt: str, model: str, parsed=None)
                 isolated_cwd or "N/A", 
                 parsed.task, 
                 model,
-                task_type="git_clone" if parsed.repo else ("workspace" if parsed.workspace else ("temp" if parsed.is_file_operation else "qa"))
+                task_type="git_clone" if parsed.repo else ("workspace" if parsed.workspace else ("temp" if parsed.is_file_operation else "qa")),
+                parsed_data={
+                    "repo": parsed.repo,
+                    "workspace": parsed.workspace,
+                    "is_file_operation": parsed.is_file_operation,
+                }
             )
 
         async for event in task.run(parsed.task, model=model):
@@ -148,7 +153,7 @@ async def _execute(thread: discord.Thread, prompt: str, model: str, parsed=None)
                 break
 
         if task_registry:
-            task_registry.update_status(thread.id, "completed")
+            task_registry.update_status(thread.id, STATUS_COMPLETED)
 
         # 生成 Patch（如有变更）
         if isolated_cwd and (parsed.repo or parsed.is_file_operation):
@@ -275,6 +280,23 @@ async def cleanup_command(interaction: discord.Interaction, thread_id: str):
     await interaction.response.send_message(f"✅ 已清理: {thread_id}", ephemeral=True)
 
 
+@bot.tree.command(name="new", description="开启全新会话，清理上一个任务的上下文")
+async def new_command(interaction: discord.Interaction):
+    """清理当前 Thread 的工作区，开启新会话"""
+    if not isinstance(interaction.channel, discord.Thread):
+        return await interaction.response.send_message("⚠️ /new 命令需要在 Thread 中使用。", ephemeral=True)
+
+    if not workspace_mgr or not task_registry:
+        return await interaction.response.send_message("⚠️ 系统未就绪。", ephemeral=True)
+
+    thread_id = interaction.channel.id
+
+    # 清理旧工作区
+    await workspace_mgr.cleanup_workspace(thread_id, registry=task_registry)
+
+    await interaction.response.send_message("🆕 全新会话已开启，工作区已清理。", ephemeral=True)
+
+
 # ============================================================================
 # 消息拦截
 # ============================================================================
@@ -284,8 +306,14 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    if isinstance(message.channel, discord.Thread) and message.channel.id in active_tasks:
-        task = active_tasks[message.channel.id]
+    if not isinstance(message.channel, discord.Thread):
+        return
+
+    thread_id = message.channel.id
+
+    # 活跃任务：直接转发消息
+    if thread_id in active_tasks:
+        task = active_tasks[thread_id]
         user_input = message.content
 
         if message.attachments:
@@ -298,6 +326,30 @@ async def on_message(message: discord.Message):
 
         if user_input.strip():
             await task.send_input(user_input)
+            await message.add_reaction("📥")
+        return
+
+    # 已完成任务：检查是否可继续
+    if task_registry and task_registry.is_resumable(thread_id):
+        # 自动继续任务
+        task_info = task_registry.get_task_by_thread(thread_id)
+        parsed_data = task_info.get("parsed_data", {})
+        
+        # 构建继续的 prompt
+        continue_prompt = message.content
+        if continue_prompt.strip():
+            await message.channel.send("🔄 继续上一个任务...")
+            
+            # 使用保存的 parsed_data 重建 ParsedTask
+            from .parser import ParsedTask
+            parsed = ParsedTask(
+                task=continue_prompt,
+                repo=parsed_data.get("repo"),
+                workspace=parsed_data.get("workspace"),
+                is_file_operation=parsed_data.get("is_file_operation", False),
+            )
+            
+            await task_queue.put((message.channel, parsed, task_info["model"]))
             await message.add_reaction("📥")
 
     await bot.process_commands(message)

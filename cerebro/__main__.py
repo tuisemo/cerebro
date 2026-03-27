@@ -1,4 +1,4 @@
 """python -m cerebro 入口"""
-from .app import main
+from cerebro.app import main
 
 main()
