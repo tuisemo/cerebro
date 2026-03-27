@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment and secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Droid workspaces (git clones for each thread)
+droid_workspaces/
+
+# Logs
+*.log
+
