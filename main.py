@@ -28,8 +28,9 @@ from ui_components import TaskDashboard, ApprovalView
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-API_KEY = os.getenv("FACTORY_API_KEY")
-BASE_REPO = os.getenv("BASE_REPO_PATH", "")
+API_KEY = os.getenv("FACTORY_API_KEY", "")
+BASE_REPO = os.getenv("BASE_REPO_PATH", "./")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude-3-5-sonnet-20241022")
 
 # 设置 API Key 环境变量供 Droid CLI 自动继承读取
 if API_KEY:
@@ -114,7 +115,7 @@ async def on_ready():
 async def task_command(
     interaction: discord.Interaction,
     prompt: str,
-    model: str = "claude-3-5-sonnet-20241022",
+    model: str = None,
 ):
     """
     主任务命令：创建独立线程并启动 Droid 处理
@@ -124,6 +125,10 @@ async def task_command(
         prompt: 用户输入的指令
         model: 使用的 AI 模型
     """
+    # 使用默认模型（如果用户未指定）
+    if model is None:
+        model = DEFAULT_MODEL
+
     # 检查工作区管理器是否就绪
     if not workspace_mgr:
         await interaction.response.send_message(
