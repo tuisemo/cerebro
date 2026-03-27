@@ -77,12 +77,19 @@ async def task_worker():
     while True:
         task_data = await task_queue.get()
         
-        # 支持两种格式：旧格式 (thread, prompt, model) 和新格式 (thread, parsed_task, model)
-        if len(task_data) == 3:
-            thread, prompt, model = task_data
+        # 支持两种格式：
+        # - 新格式: (thread, ParsedTask, model)
+        # - 旧格式: (thread, prompt_str, model)
+        thread = task_data[0]
+        model = task_data[2]
+        
+        if isinstance(task_data[1], str):
+            # 旧格式：第二个元素是字符串 prompt
+            prompt = task_data[1]
             parsed = parse_task_command(prompt)
         else:
-            thread, parsed, model = task_data
+            # 新格式：第二个元素是 ParsedTask 对象
+            parsed = task_data[1]
             prompt = parsed.task
         
         try:
