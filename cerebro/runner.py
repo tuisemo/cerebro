@@ -58,6 +58,7 @@ File paths use backslashes on Windows.]"""
             self.droid_exe,
             "exec",
             "--output-format", "debug",
+            "--auto", "medium",  # 自动确认中等风险操作
             "--cwd", self.cwd,
             "-m", model,
         ]
