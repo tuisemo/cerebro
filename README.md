@@ -1,6 +1,8 @@
 # Cerebro — 群体智能协同引擎
 
 > 基于 Discord 的 Factory Droid CLI 协同调度机器人，支持多场景任务模式、智能工作区隔离与流式交互。
+>
+> 📖 [English Version](README_EN.md)
 
 ## 项目概览
 
