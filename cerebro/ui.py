@@ -50,7 +50,9 @@ class TaskDashboard:
 
     async def error(self, error_message: str) -> None:
         self.embed.color = discord.Color.red()
-        self.embed.set_field_at(0, name="🔄 状态", value=f"❌ 任务失败: {error_message}", inline=True)
+        # Discord embed field 有 1024 字符限制，截断
+        truncated_msg = error_message[:1000] + ("..." if len(error_message) > 1000 else "")
+        self.embed.set_field_at(0, name="🔄 状态", value=f"❌ 任务失败: {truncated_msg}", inline=True)
 
         if self.message:
             await self.message.edit(embed=self.embed)

@@ -13,6 +13,8 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
+logger = logging.getLogger(__name__)
+
 
 class WorkspaceError(Exception):
     """工作区管理异常"""

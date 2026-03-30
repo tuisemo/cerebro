@@ -9,6 +9,7 @@ import asyncio
 import os
 import io
 import logging
+from datetime import datetime
 from typing import Optional
 from pathlib import Path
 
@@ -29,11 +30,40 @@ from .parser import parse_task_command, format_task_preview
 # 日志
 # ============================================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s │ %(levelname)-7s │ %(name)s │ %(message)s",
-    datefmt="%H:%M:%S",
+LOG_DIR = os.getenv("LOG_DIR", "./logs")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(10 * 1024 * 1024)))  # 默认 10MB
+LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "7"))  # 默认保留 7 天
+
+import pathlib
+log_path = pathlib.Path(LOG_DIR)
+log_path.mkdir(parents=True, exist_ok=True)
+
+root_logger = logging.getLogger()
+root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+# 文件输出：按日期归档，每日一个文件
+file_handler = logging.FileHandler(
+    log_path / f"cerebro_{datetime.now().strftime('%Y%m%d')}.log",
+    encoding="utf-8",
 )
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(logging.Formatter(
+    fmt="%(asctime)s │ %(levelname)-7s │ %(name)s │ %(message)s",
+    datefmt="%H:%M:%S",
+))
+
+# 控制台输出
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.WARNING)
+console_handler.setFormatter(logging.Formatter(
+    fmt="%(asctime)s │ %(levelname)-7s │ %(message)s",
+    datefmt="%H:%M:%S",
+))
+
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
+
 logger = logging.getLogger("Cerebro")
 
 
@@ -219,8 +249,8 @@ async def _execute(thread: discord.Thread, prompt: str, model: str, parsed=None,
             task_registry.update_status(thread.id, STATUS_WAITING)
             if session_id:
                 task_registry.set_session_id(thread.id, session_id)
-        await dashboard.error(str(e))
-        await thread.send(f"❌ **任务执行失败:** {e}")
+        await dashboard.error(str(e)[:800])
+        await thread.send(f"❌ **任务执行失败:** {str(e)[:1900]}")
 
     finally:
         # 延迟清理活跃任务记录，防止过早清理导致用户连续输入无法走 send_input

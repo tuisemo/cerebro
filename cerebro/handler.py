@@ -211,7 +211,8 @@ class DroidEventHandler:
 
         if result_preview.strip():
             suffix = "\n> *(已截断，完整结果见工作区)*" if truncated else ""
-            await self.throttle.send(f"{emoji} **{tool_name} 执行反馈:**\n```\n{result_preview}\n```{suffix}")
+            safe_result = result_preview.replace("```", "`` `")
+            await self.throttle.send(f"{emoji} **{tool_name} 执行反馈:**\n```\n{safe_result}\n```{suffix}")
 
         await self.dashboard.update(status="✅ 工具调用完成")
         return True
@@ -228,8 +229,9 @@ class DroidEventHandler:
     async def _on_error(self, event: dict) -> bool:
         await self._flush()
         error_msg = event.get("text", event.get("message", "未知错误"))
-        await self.dashboard.error(error_msg)
-        await self.throttle.send(f"❌ **运行中止:** {error_msg}")
+        await self.dashboard.error(error_msg[:800])
+        safe_err = error_msg[:1900].replace("```", "`` `")
+        await self.throttle.send(f"❌ **运行中止:** {safe_err}")
         return False
 
     async def _flush(self):
@@ -261,6 +263,7 @@ class DroidEventHandler:
         if not send_success:
             return
 
+        # 即使发送成功也要清理 buffer；失败则静默丢弃（下次 flush 重试）
         self._buffer = remainder
         self._last_flush_time = time.time()
         # 有剩余内容时强制下次发新消息，避免覆盖已发出的分页
