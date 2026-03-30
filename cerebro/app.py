@@ -130,17 +130,17 @@ async def _execute(thread: discord.Thread, prompt: str, model: str, parsed=None)
         workspace_info = format_task_preview(parsed)
         await thread.send(f"📋 **任务模式:** {workspace_info}")
 
-        task = DroidTask(cwd=isolated_cwd) if isolated_cwd else DroidTask(cwd=".")
+        task = DroidTask(cwd=isolated_cwd)
         active_tasks[thread.id] = task
         handler = DroidEventHandler(thread, dashboard)
 
         if task_registry:
             task_registry.register_task(
                 thread.id, 
-                isolated_cwd or "N/A", 
+                isolated_cwd, 
                 parsed.task, 
                 model,
-                task_type="git_clone" if parsed.repo else ("workspace" if parsed.workspace else ("temp" if parsed.is_file_operation else "qa")),
+                task_type="git_clone" if parsed.repo else ("workspace" if parsed.workspace else "temp"),
                 parsed_data={
                     "repo": parsed.repo,
                     "workspace": parsed.workspace,
@@ -156,7 +156,7 @@ async def _execute(thread: discord.Thread, prompt: str, model: str, parsed=None)
             task_registry.update_status(thread.id, STATUS_COMPLETED)
 
         # 生成 Patch（如有变更）
-        if isolated_cwd and (parsed.repo or parsed.is_file_operation):
+        if parsed.repo or parsed.is_file_operation:
             patch_data = await workspace_mgr.generate_patch(thread.id)
             if patch_data and patch_data.strip():
                 patch_file = discord.File(

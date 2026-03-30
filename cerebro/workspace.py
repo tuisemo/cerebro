@@ -36,7 +36,7 @@ class WorkspaceManager:
         repo_path: str = None,
         workspace_path: str = None,
         is_file_operation: bool = False,
-    ) -> Optional[str]:
+    ) -> str:
         """
         获取或创建工作区
 
@@ -47,7 +47,7 @@ class WorkspaceManager:
             is_file_operation: 是否需要文件系统操作
 
         Returns:
-            工作区路径，不需要文件系统时返回 None
+            工作区路径（始终返回有效路径）
         """
         # 模式1: 指定仓库 - 克隆 Git 仓库
         if repo_path:
@@ -57,12 +57,8 @@ class WorkspaceManager:
         if workspace_path:
             return await self._use_directory(thread_id, workspace_path)
 
-        # 模式3: 临时目录（需要文件操作时）
-        if is_file_operation:
-            return await self._create_temp_workspace(thread_id)
-
-        # 模式4: 无文件系统（S1 纯问答）
-        return None
+        # 模式3/4: 始终创建临时工作区（包括 QA 模式）
+        return await self._create_temp_workspace(thread_id)
 
     async def _clone_repo(self, thread_id: int, repo_path: str) -> str:
         """从指定仓库克隆到工作区"""
