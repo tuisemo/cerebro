@@ -8,6 +8,7 @@
 """
 
 import asyncio
+import logging
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -67,9 +68,9 @@ class WorkspaceManager:
         # 目标目录
         target_dir = self.workspaces_dir / str(thread_id)
 
-        # 如果已存在，先清理
+        # 如果已存在，直接复用，不重新克隆
         if target_dir.exists():
-            shutil.rmtree(target_dir, ignore_errors=True)
+            return str(target_dir)
 
         # 确保源路径存在
         if not source_path.exists():
@@ -111,16 +112,16 @@ class WorkspaceManager:
     async def _use_directory(self, thread_id: int, workspace_path: str) -> str:
         """直接使用指定目录"""
         target_path = Path(workspace_path).resolve()
+        
+        # 检查路径遍历：确保目标路径在允许的根目录内
+        # 允许的根目录为 workspaces_dir 的父目录（允许 workspaces_dir 内的任意路径）
+        allowed_root = self.workspaces_dir.parent.resolve()
+        try:
+            target_path.relative_to(allowed_root)
+        except ValueError:
+            raise WorkspaceError(f"路径遍历检测失败: {workspace_path} 超出允许根目录 {allowed_root}")
+        
         target_path.mkdir(parents=True, exist_ok=True)
-        
-        # 目标目录（用于追踪）
-        target_dir = self.workspaces_dir / str(thread_id)
-        
-        # 如果目标目录不存在，创建符号链接或复制
-        if not target_dir.exists():
-            # 直接使用原目录
-            target_dir.mkdir(parents=True, exist_ok=True)
-            # 将原目录的内容链接/复制过来（简化处理：直接返回原目录）
         
         return str(target_path)
 
@@ -153,31 +154,49 @@ class WorkspaceManager:
         if not target_dir.exists():
             return None
 
+        timeout = 10.0
         try:
             # 检查是否是 Git 仓库
             if not (target_dir / ".git").exists():
                 return None
 
-            await asyncio.create_subprocess_exec(
+            proc = await asyncio.create_subprocess_exec(
                 "git", "-C", str(target_dir), "add", ".",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                logging.warning(f"generate_patch: git add timed out for thread {thread_id}")
+                return None
 
             status_proc = await asyncio.create_subprocess_exec(
                 "git", "-C", str(target_dir), "status", "--porcelain",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await status_proc.communicate()
+            try:
+                stdout, _ = await asyncio.wait_for(status_proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                status_proc.kill()
+                logging.warning(f"generate_patch: git status timed out for thread {thread_id}")
+                return None
             status_output = stdout.decode("utf-8", errors="replace").strip()
 
             if status_output:
-                await asyncio.create_subprocess_exec(
+                commit_proc = await asyncio.create_subprocess_exec(
                     "git", "-C", str(target_dir), "commit", "-m", "Auto-commit by Droid",
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
+                try:
+                    await asyncio.wait_for(commit_proc.communicate(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    commit_proc.kill()
+                    logging.warning(f"generate_patch: git commit timed out for thread {thread_id}")
+                    return None
 
                 # 获取当前分支与原始分支的 diff
                 proc = await asyncio.create_subprocess_exec(
@@ -185,7 +204,12 @@ class WorkspaceManager:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                stdout, _ = await proc.communicate()
+                try:
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    logging.warning(f"generate_patch: git diff timed out for thread {thread_id}")
+                    return None
                 return stdout.decode("utf-8", errors="replace") if stdout else None
 
         except Exception as e:
@@ -208,7 +232,8 @@ class WorkspaceManager:
                 for item in stale_list:
                     t_id = item["thread_id"]
                     await self.cleanup_workspace(t_id, registry=registry)
-
-                await asyncio.sleep(interval_hours * 3600)
+                logger.info(f"🧹 清理了 {len(stale_list)} 个过期工作区")
             except Exception as e:
-                await asyncio.sleep(300)
+                logger.warning(f"[auto_cleanup] 清理异常: {e}")
+
+            await asyncio.sleep(interval_hours * 3600)

@@ -7,11 +7,15 @@ Droid 事件流处理器
 """
 
 import asyncio
+import logging
 import os
 import discord
 import discord.ui
+import time
 from .ui import TaskDashboard
 from .throttle import MessageThrottle
+
+logger = logging.getLogger(__name__)
 
 
 # 高危命令模式（需用户显式确认）
@@ -28,14 +32,17 @@ MODERATE_RISK_TOOLS = ["Execute", "execute_command"]
 class ConfirmView(discord.ui.View):
     """高危操作确认按钮"""
 
-    def __init__(self, tool_name: str, cmd: str, timeout: float = 60.0):
+    def __init__(self, tool_name: str, cmd: str, requester_id: int = None, timeout: float = 60.0):
         super().__init__(timeout=timeout)
         self.tool_name = tool_name
         self.cmd = cmd
+        self.requester_id = requester_id
         self.result = None
-        self.message = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.requester_id and interaction.user.id != self.requester_id:
+            await interaction.response.send_message("⚠️ 只有任务发起人可以操作此确认按钮。", ephemeral=True)
+            return False
         return True
 
     @discord.ui.button(label="允许执行", style=discord.ButtonStyle.success, emoji="✅")
@@ -71,10 +78,10 @@ class SmartApprovalHandler:
     - 普通操作：直接放行
     """
 
-    def __init__(self, thread: discord.Thread, throttle: MessageThrottle):
+    def __init__(self, thread: discord.Thread, throttle: MessageThrottle, requester_id: int = None):
         self.thread = thread
         self.throttle = throttle
-        self.pending_cancel = False
+        self.requester_id = requester_id
 
     def is_high_risk(self, cmd: str) -> bool:
         """检查是否为高危命令"""
@@ -83,22 +90,13 @@ class SmartApprovalHandler:
 
     async def notify_moderate(self, tool_name: str, cmd: str):
         """中等风险：发送通知，不等待"""
-        msg = await self.throttle.send(
-            f"⚡ **即将执行指令:**\n```bash\n{cmd[:500]}\n```\n"
-            f"⏳ 3秒后自动执行，回复 `cancel` 可取消..."
+        await self.throttle.send(
+            f"⚡ **即将执行指令:**\n```bash\n{cmd[:500]}\n```"
         )
-        # 后台等待，用户可回复 cancel
-        asyncio.create_task(self._check_cancel(msg, cmd))
-
-    async def _check_cancel(self, msg: discord.Message, cmd: str):
-        """后台任务：检查用户是否取消"""
-        await asyncio.sleep(3)
-        # 简化处理：3秒后自动继续，不实际检查 cancel 回复
-        # 如需完整实现，可添加消息监听器
 
     async def request_high_risk(self, tool_name: str, cmd: str) -> bool:
         """高危操作：阻塞等待用户确认"""
-        view = ConfirmView(tool_name, cmd)
+        view = ConfirmView(tool_name, cmd, requester_id=self.requester_id)
         await self.throttle.send(
             f"🚨 **高危操作需确认:**\n```bash\n{cmd}\n```",
             view=view
@@ -109,17 +107,19 @@ class SmartApprovalHandler:
 class DroidEventHandler:
     """将 Droid 事件映射为 Discord 对话输出"""
 
-    def __init__(self, thread: discord.Thread, dashboard: TaskDashboard):
+    def __init__(self, thread: discord.Thread, dashboard: TaskDashboard, requester_id: int = None):
         self.thread = thread
         self.dashboard = dashboard
         self._buffer = ""
         self._last_msg: discord.Message | None = None
         self.throttle = MessageThrottle(thread)
-        self.approval = SmartApprovalHandler(thread, self.throttle)
+        self.approval = SmartApprovalHandler(thread, self.throttle, requester_id=requester_id)
+        self._last_flush_time = time.time()
 
     async def handle(self, event: dict) -> bool:
         """处理单个事件。返回 False 表示流应终止。"""
         etype = event.get("type", "")
+        logger.info(f"[HANDLER] type={etype} keys={list(event.keys())}")
 
         if etype in ("assistant_chunk", "thinking"):
             return await self._on_assistant_text(event)
@@ -133,6 +133,13 @@ class DroidEventHandler:
             return await self._on_completion(event)
         elif etype == "error":
             return await self._on_error(event)
+            
+        # 兜底逻辑：未知类型事件也尝试提取文本内容
+        if "text" in event or "content" in event:
+            text = event.get("text", event.get("content", ""))
+            if text:
+                event["text"] = str(text)
+                return await self._on_assistant_text(event)
 
         return True
 
@@ -142,11 +149,22 @@ class DroidEventHandler:
         return True
 
     async def _on_assistant_text(self, event: dict) -> bool:
-        text = event.get("text", "")
+        # 兼容不同模型或事件类型的字段：text 或 content 或 delta
+        text = event.get("text", event.get("content", event.get("delta", "")))
+        if isinstance(text, dict):
+            # 兼容嵌套的 openai 风格 Delta
+            text = text.get("content", text.get("text", ""))
+            
+        text = str(text) if text else ""
         if text:
             self._buffer += text
-            if len(text) > 20 or "\n" in text or len(self._buffer) > 100:
+            current_time = time.time()
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("[TEXT] buffer_len=%d text_len=%d will_flush=%s", len(self._buffer), len(text), len(text) > 10 or "\n" in text or len(self._buffer) > 50 or (current_time - self._last_flush_time) > 2.0)
+            # 降低 flush 阈值：短消息或换行符触发，或 buffer 超过阈值，或超过时间阈值
+            if len(text) > 10 or "\n" in text or len(self._buffer) > 50 or (current_time - self._last_flush_time) > 2.0:
                 await self._flush()
+                self._last_flush_time = current_time
                 await self.dashboard.update(status="🧠 正在思考与回复...")
         return True
 
@@ -158,7 +176,8 @@ class DroidEventHandler:
         status_msg = f"🔍 **Droid 正在尝试使用工具:** `{tool_name}`"
         if tool_name in ["Execute", "execute_command"]:
             cmd_detail = event.get("parameters", {}).get("command", "")
-            status_msg = f"⚙️ **正在执行指令:**\n```bash\n{cmd_detail[:500]}\n```"
+            cmd_safe = cmd_detail[:500].replace("```", "`` `")
+            status_msg = f"⚙️ **正在执行指令:**\n```bash\n{cmd_safe}\n```"
             
             # 智能确认机制
             if self.approval.is_high_risk(cmd_detail):
@@ -186,17 +205,24 @@ class DroidEventHandler:
         is_error = event.get("isError", False)
 
         emoji = "❌" if is_error else "✅"
-        result_preview = str(event.get("value", event.get("result", "")))[:200]
+        raw_result = str(event.get("value", event.get("result", "")))
+        truncated = len(raw_result) > 1000
+        result_preview = raw_result[:1000]
 
         if result_preview.strip():
-            await self.throttle.send(f"{emoji} **{tool_name} 执行反馈:**\n> {result_preview}")
+            suffix = "\n> *(已截断，完整结果见工作区)*" if truncated else ""
+            await self.throttle.send(f"{emoji} **{tool_name} 执行反馈:**\n```\n{result_preview}\n```{suffix}")
 
         await self.dashboard.update(status="✅ 工具调用完成")
         return True
 
     async def _on_completion(self, event: dict) -> bool:
         await self._flush()
-        await self.dashboard.complete()
+        # 发送任务完成确认消息
+        await self.throttle.send("✅ **任务执行完成**")
+        await self.dashboard.update(status="⏳ 等待用户继续输入...")
+        # 返回 False 让事件循环正常结束，进程会退出
+        # 但 session 保持活跃状态，后续通过新进程继续对话
         return False
 
     async def _on_error(self, event: dict) -> bool:
@@ -207,19 +233,36 @@ class DroidEventHandler:
         return False
 
     async def _flush(self):
-        """将缓冲文本发送到 Discord (受节流器保护)"""
+        """将缓冲文本发送到 Discord (受节流器保护)，支持超长内容分页"""
         if not self._buffer.strip():
             return
 
-        text = self._buffer[:2000]
-        if self._last_msg:
-            try:
-                await self.throttle.edit(self._last_msg, content=text)
-            except:
-                self._last_msg = await self.throttle.send(text)
-        else:
-            self._last_msg = await self.throttle.send(text)
+        chunk = self._buffer[:2000]
+        remainder = self._buffer[2000:]
+        logger.info(f"[FLUSH] sending len={len(chunk)} remainder={len(remainder)} has_last_msg={self._last_msg is not None}")
 
-        if len(self._buffer) > 1500:
+        send_success = False
+        # 只有在没有后续内容时才尝试 edit（避免覆盖已发出的消息）
+        if self._last_msg and not remainder:
+            try:
+                await self.throttle.edit(self._last_msg, content=chunk)
+                send_success = True
+            except Exception as e:
+                logger.warning(f"[_flush] edit failed: {e}")
+                self._last_msg = None
+
+        if not send_success:
+            try:
+                self._last_msg = await self.throttle.send(chunk)
+                send_success = True
+            except Exception as e:
+                logger.error(f"[_flush] send failed: {e}")
+
+        if not send_success:
+            return
+
+        self._buffer = remainder
+        self._last_flush_time = time.time()
+        # 有剩余内容时强制下次发新消息，避免覆盖已发出的分页
+        if remainder:
             self._last_msg = None
-            self._buffer = ""

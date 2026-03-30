@@ -1,34 +1,32 @@
 """
 Droid 进程控制与事件流解析模块
-
-负责底层 Droid CLI 进程的生命周期管理，双向数据流通信与 JSON 解析。
-针对 Windows 原生环境进行了适配处理。
 """
 
 import asyncio
 import json
+import logging
 import shutil
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncGenerator, Optional
+
+logger = logging.getLogger(__name__)
+
+_thread_pool = ThreadPoolExecutor(max_workers=8)
 
 
 class DroidProcessError(Exception):
-    """Droid 进程异常"""
     pass
 
 
 class DroidTask:
-    """Droid 进程任务管理器"""
-
     def __init__(self, cwd: str):
         self.cwd = cwd
-        self.process: Optional[asyncio.subprocess.Process] = None
-
-        # [Windows 适配] 动态寻找可执行文件路径
+        self.process: Optional[subprocess.Popen] = None
+        self.session_id: Optional[str] = None
         self.droid_exe = shutil.which("droid")
         if not self.droid_exe:
-            raise FileNotFoundError(
-                "Droid CLI 未在环境变量中找到，请确认已安装 Droid。"
-            )
+            raise FileNotFoundError("Droid CLI 未在环境变量中找到，请确认已安装 Droid。")
 
     async def run(
         self,
@@ -36,81 +34,106 @@ class DroidTask:
         model: str = "claude-3-5-sonnet-20241022",
         session_id: Optional[str] = None,
     ) -> AsyncGenerator[dict, None]:
-        """
-        启动 Droid 进程并yield解析后的事件流
+        import sys
 
-        Args:
-            prompt: 用户输入的指令
-            model: 使用的模型标识
-            session_id: 可选的会话ID
+        if sys.platform == "win32":
+            prompt = f"""{prompt}
 
-        Yields:
-            解析后的事件字典，包含 type, text, toolName 等字段
-        """
-        # [Windows 适配] 注入系统级 Prompt，规范大模型在 Windows 下的 Shell 行为
-        windows_prompt = f"""{prompt}
-
-[System Note: You are operating in a Native Windows environment. Use PowerShell/CMD syntax 
-(e.g., 'dir', 'del', 'type') instead of Linux commands like 'rm -rf', 'ls', 'cat'. 
+[System Note: You are operating in a Native Windows environment. Use PowerShell/CMD syntax
+(e.g., 'dir', 'del', 'type') instead of Linux commands like 'rm -rf', 'ls', 'cat'.
 File paths use backslashes on Windows.]"""
 
         cmd = [
             self.droid_exe,
             "exec",
             "--output-format", "debug",
-            "--auto", "medium",  # 自动确认中等风险操作
+            "--auto", "medium",
             "--cwd", self.cwd,
             "-m", model,
         ]
         if session_id:
             cmd.extend(["--session-id", session_id])
-        cmd.append(windows_prompt)
+        cmd.append(prompt)
 
-        self.process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=self.cwd,
-        )
+        logger.info(f"[RUNNER] Spawning: {cmd}")
 
-        buffer = ""
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def _run_process():
+            """在独立线程中运行整个进程，完全脱离 ProactorEventLoop 的 IOCP 管理"""
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,  # 不需要 stdin，直接接 devnull
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    cwd=self.cwd,
+                )
+                self.process = proc
+                count = 0
+                for line_bytes in iter(proc.stdout.readline, b""):
+                    if line_bytes:
+                        count += 1
+                        loop.call_soon_threadsafe(queue.put_nowait, line_bytes)
+                proc.stdout.close()
+                proc.wait()
+                logger.info(f"[READER] done rc={proc.returncode} lines={count}")
+            except Exception as e:
+                logger.error(f"[RUNNER] thread error: {e}")
+                loop.call_soon_threadsafe(queue.put_nowait, json.dumps({"type": "error", "text": str(e)}).encode())
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        _thread_pool.submit(_run_process)
+
+        process_completed_normally = False
         try:
-            async for line in self.process.stdout:
-                # [Windows 适配] Windows 系统命令常输出 GBK/UTF-8 混杂编码
-                buffer += line.decode("utf-8", errors="replace")
+            while True:
+                try:
+                    line_bytes = await asyncio.wait_for(queue.get(), timeout=120.0)
+                except asyncio.TimeoutError:
+                    logger.warning("[RUNNER] 120s timeout waiting for output")
+                    yield {"type": "error", "text": "任务超时（120秒无输出）"}
+                    break
 
-                while "\n" in buffer:
-                    line_str, buffer = buffer.split("\n", 1)
-                    line_str = line_str.strip()
-                    if not line_str:
-                        continue
-                    try:
-                        yield json.loads(line_str)
-                    except json.JSONDecodeError:
-                        # 非 JSON 行，可能是普通输出
-                        yield {"type": "raw_output", "text": line_str}
+                if line_bytes is None:
+                    break
+
+                line_str = line_bytes.decode("utf-8", errors="replace").strip()
+                if not line_str:
+                    continue
+
+                try:
+                    event = json.loads(line_str)
+                    logger.info(f"[EVENT] type={event.get('type', 'unknown')} keys={list(event.keys())}")
+                    # Capture droid's real session_id from system/init event
+                    if event.get("type") == "system" and event.get("subtype") == "init" and event.get("session_id"):
+                        self.session_id = event["session_id"]
+                        logger.info(f"[RUNNER] Captured droid session_id: {self.session_id[:8]}...")
+                    yield event
+                    if event.get("type") == "completion":
+                        process_completed_normally = True
+                except json.JSONDecodeError:
+                    logger.info(f"[RAW] {line_str[:200]}")
+                    yield {"type": "raw_output", "text": line_str}
+
+        except Exception as e:
+            logger.error(f"[RUNNER] consumer exception: {e}")
+            yield {"type": "error", "text": str(e)}
+
         finally:
-            if self.process:
-                await self.process.wait()
-                self.process = None
-
-    async def send_input(self, text: str) -> None:
-        """
-        向 Droid 进程写入交互流（如批准 Y/N 或补充文字）
-
-        Args:
-            text: 要发送给进程的文本
-        """
-        if self.process and self.process.stdin:
-            self.process.stdin.write(f"{text}\n".encode("utf-8"))
-            await self.process.stdin.drain()
+            if self.process and self.process.poll() is None:
+                try:
+                    self.process.terminate()
+                except Exception:
+                    pass
+            self.process = None
 
     def kill(self) -> None:
-        """异常情况下强杀进程"""
-        if self.process:
+        if self.process and self.process.poll() is None:
             try:
                 self.process.terminate()
-            except ProcessLookupError:
+            except Exception:
                 pass
             self.process = None

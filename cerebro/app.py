@@ -21,7 +21,7 @@ from .runner import DroidTask
 from .workspace import WorkspaceManager, WorkspaceError
 from .ui import TaskDashboard
 from .handler import DroidEventHandler
-from .registry import TaskRegistry, STATUS_COMPLETED
+from .registry import TaskRegistry, STATUS_COMPLETED, STATUS_WAITING
 from .parser import parse_task_command, format_task_preview
 
 
@@ -48,6 +48,7 @@ API_KEY = os.getenv("FACTORY_API_KEY", "")
 WORKSPACES_DIR = os.getenv("WORKSPACES_DIR", "./droid_workspaces")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "custom:MiniMax-M2.7")
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_TASKS", "2"))
+TASK_TIMEOUT_MINUTES = int(os.getenv("TASK_TIMEOUT_MINUTES", "10"))  # 任务超时时间（分钟）
 
 if API_KEY:
     os.environ["FACTORY_API_KEY"] = API_KEY
@@ -64,7 +65,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 workspace_mgr: Optional[WorkspaceManager] = None
 task_registry: Optional[TaskRegistry] = None
 active_tasks: dict[int, DroidTask] = {}
-task_queue: asyncio.Queue = asyncio.Queue()
+task_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
 
 
 # ============================================================================
@@ -76,38 +77,69 @@ async def task_worker():
     logger.info("👷 Worker 已就绪")
     while True:
         task_data = await task_queue.get()
-        
-        # 支持两种格式：
-        # - 新格式: (thread, ParsedTask, model)
-        # - 旧格式: (thread, prompt_str, model)
+
+        # 支持多种格式：
+        # - 最新格式: (thread, ParsedTask, model, session_id, requester_id)
+        # - 新格式: (thread, ParsedTask, model, session_id)
+        # - 旧格式: (thread, ParsedTask, model)
+        # - 更旧格式: (thread, prompt_str, model)
         thread = task_data[0]
         model = task_data[2]
-        
+        session_id = task_data[3] if len(task_data) > 3 else None
+        requester_id = task_data[4] if len(task_data) > 4 else None
+
         if isinstance(task_data[1], str):
-            # 旧格式：第二个元素是字符串 prompt
             prompt = task_data[1]
             parsed = parse_task_command(prompt)
         else:
-            # 新格式：第二个元素是 ParsedTask 对象
             parsed = task_data[1]
             prompt = parsed.task
-        
+
         try:
-            await _execute(thread, prompt, model, parsed)
+            await _execute(thread, prompt, model, parsed, session_id, requester_id)
         except Exception as e:
             logger.error(f"Worker 异常: {e}", exc_info=True)
         finally:
             task_queue.task_done()
 
 
-async def _execute(thread: discord.Thread, prompt: str, model: str, parsed=None):
+async def _execute(thread: discord.Thread, prompt: str, model: str, parsed=None, session_id=None, requester_id: int = None):
     """核心任务执行"""
     # 解析任务参数
     if parsed is None:
         parsed = parse_task_command(prompt)
-    
+
     dashboard = TaskDashboard(parsed.task)
     await dashboard.send_to(thread)
+
+    # 在获取工作区之前先确定 session_id 并注册任务，确保即使工作区获取失败也有记录
+    if session_id is None:
+        if task_registry:
+            session_id = task_registry.get_session_id(thread.id)
+            if session_id:
+                logger.info(f"🔄 复用已有 session_id: {session_id[:8]}... for thread {thread.id}")
+            else:
+                logger.info(f"🆕 新任务，session_id 将由 droid 分配 for thread {thread.id}")
+        else:
+            logger.info(f"🆕 新任务，session_id 将由 droid 分配 for thread {thread.id}")
+    else:
+        logger.info(f"🔄 使用传入的 session_id: {session_id[:8]}... for thread {thread.id}")
+
+    # 在获取工作区之前先注册任务（用占位符），确保即使工作区获取失败也有 DB 记录
+    if task_registry:
+        task_registry.register_task(
+            thread.id,
+            "pending",
+            parsed.task,
+            model,
+            task_type="git_clone" if parsed.repo else ("workspace" if parsed.workspace else "temp"),
+            parsed_data={
+                "repo": parsed.repo,
+                "workspace": parsed.workspace,
+                "is_file_operation": parsed.is_file_operation,
+            },
+            session_id=session_id
+        )
 
     try:
         # 获取工作区
@@ -126,34 +158,45 @@ async def _execute(thread: discord.Thread, prompt: str, model: str, parsed=None)
                 is_file_operation=parsed.is_file_operation,
             )
 
-        # 记录任务信息
-        workspace_info = format_task_preview(parsed)
-        await thread.send(f"📋 **任务模式:** {workspace_info}")
-
-        task = DroidTask(cwd=isolated_cwd)
-        active_tasks[thread.id] = task
-        handler = DroidEventHandler(thread, dashboard)
-
+        # 工作区就绪后更新真实路径
         if task_registry:
             task_registry.register_task(
-                thread.id, 
-                isolated_cwd, 
-                parsed.task, 
+                thread.id,
+                isolated_cwd,
+                parsed.task,
                 model,
                 task_type="git_clone" if parsed.repo else ("workspace" if parsed.workspace else "temp"),
                 parsed_data={
                     "repo": parsed.repo,
                     "workspace": parsed.workspace,
                     "is_file_operation": parsed.is_file_operation,
-                }
+                },
+                session_id=session_id
             )
 
-        async for event in task.run(parsed.task, model=model):
+        # 记录任务信息
+        workspace_info = format_task_preview(parsed)
+        await thread.send(f"📋 **任务模式:** {workspace_info}")
+
+        task = DroidTask(cwd=isolated_cwd)
+        active_tasks[thread.id] = task
+        handler = DroidEventHandler(thread, dashboard, requester_id=requester_id)
+
+        # 主事件循环 - 处理 Droid 输出
+        async for event in task.run(parsed.task, model=model, session_id=session_id):
             if not await handler.handle(event):
                 break
 
+        # 任务完成后，捕获 droid 返回的真实 session_id 并持久化
+        if task.session_id:
+            session_id = task.session_id
+            logger.info(f"✅ 已从 droid 捕获 session_id: {session_id[:8]}... for thread {thread.id}")
+            if task_registry:
+                task_registry.set_session_id(thread.id, session_id)
+
+        # 任务完成，更新状态为 waiting（等待用户继续输入）
         if task_registry:
-            task_registry.update_status(thread.id, STATUS_COMPLETED)
+            task_registry.update_status(thread.id, STATUS_WAITING)
 
         # 生成 Patch（如有变更）
         if parsed.repo or parsed.is_file_operation:
@@ -167,17 +210,26 @@ async def _execute(thread: discord.Thread, prompt: str, model: str, parsed=None)
             else:
                 await thread.send("✨ **任务结束，环境检查完成且无代码变动。**")
         else:
-            await thread.send("✨ **任务结束。**")
+            await thread.send("✨ **任务结束，等待继续输入...**")
 
     except Exception as e:
         logger.error(f"任务 {thread.id} 失败: {e}")
         if task_registry:
-            task_registry.update_status(thread.id, "error")
+            # 保存 session_id 确保用户可继续对话重试
+            task_registry.update_status(thread.id, STATUS_WAITING)
+            if session_id:
+                task_registry.set_session_id(thread.id, session_id)
         await dashboard.error(str(e))
         await thread.send(f"❌ **任务执行失败:** {e}")
 
     finally:
-        active_tasks.pop(thread.id, None)
+        # 延迟清理活跃任务记录，防止过早清理导致用户连续输入无法走 send_input
+        def _delayed_cleanup():
+            task = active_tasks.get(thread.id)
+            if task and (task.process is None or task.process.returncode is not None):
+                active_tasks.pop(thread.id, None)
+        
+        bot.loop.call_later(30.0, _delayed_cleanup)
 
 
 # ============================================================================
@@ -193,6 +245,13 @@ async def on_ready():
     try:
         workspace_mgr = WorkspaceManager(workspaces_dir=WORKSPACES_DIR)
         task_registry = TaskRegistry()
+
+        # 重置上次运行遗留的 active 任务（进程已不存在）
+        stale_active = task_registry.get_active_tasks()
+        for t in stale_active:
+            task_registry.update_status(t["thread_id"], STATUS_WAITING)
+        if stale_active:
+            logger.info(f"🔁 重置 {len(stale_active)} 个遗留 active 任务为 waiting")
 
         bot.loop.create_task(workspace_mgr.auto_cleanup_loop(task_registry))
         for _ in range(MAX_CONCURRENT):
@@ -237,6 +296,9 @@ async def task_command(interaction: discord.Interaction, prompt: str, model: str
     if not workspace_mgr:
         return await interaction.response.send_message("⚠️ 系统未就绪。", ephemeral=True)
 
+    # 立即 defer，防止 Discord 3秒超时
+    await interaction.response.defer(ephemeral=True)
+
     # 解析指令
     parsed = parse_task_command(prompt)
 
@@ -249,8 +311,6 @@ async def task_command(interaction: discord.Interaction, prompt: str, model: str
             name=name, type=discord.ChannelType.public_thread
         )
 
-    await interaction.response.defer(ephemeral=True)
-
     # 预览任务配置
     preview = format_task_preview(parsed)
     queue_pos = task_queue.qsize() + 1
@@ -259,7 +319,7 @@ async def task_command(interaction: discord.Interaction, prompt: str, model: str
         msg = f"⏳ 已入队，当前排第 {queue_pos} 位。\n{preview}"
 
     await interaction.followup.send(msg, ephemeral=True)
-    await task_queue.put((thread, parsed, model))
+    await task_queue.put((thread, parsed, model, None, interaction.user.id))
 
 
 @bot.tree.command(name="status", description="查看 Cerebro 系统状态")
@@ -291,10 +351,16 @@ async def new_command(interaction: discord.Interaction):
 
     thread_id = interaction.channel.id
 
-    # 清理旧工作区
-    await workspace_mgr.cleanup_workspace(thread_id, registry=task_registry)
+    # 只清理磁盘上的工作区文件，不删除 DB 记录
+    await workspace_mgr.cleanup_workspace(thread_id, registry=None)
+    
+    # 清除 session_id，下次发消息将以新 session 继续
+    task_registry.clear_session_id(thread_id)
+    # 重置状态为 waiting，确保 is_resumable 返回 True
+    task_registry.update_status(thread_id, STATUS_WAITING)
+    logger.info(f"🆕 Thread {thread_id} 上下文已重置，session_id 已清除")
 
-    await interaction.response.send_message("🆕 全新会话已开启，工作区已清理。", ephemeral=True)
+    await interaction.response.send_message("🆕 上下文已重置，直接发送消息即可开启新会话。", ephemeral=True)
 
 
 # ============================================================================
@@ -310,47 +376,65 @@ async def on_message(message: discord.Message):
         return
 
     thread_id = message.channel.id
+    user_input = message.content.strip()
 
-    # 活跃任务：直接转发消息
-    if thread_id in active_tasks:
-        task = active_tasks[thread_id]
-        user_input = message.content
-
-        if message.attachments:
-            f_list = []
-            for att in message.attachments:
-                save_path = Path(task.cwd) / att.filename
-                await att.save(save_path)
-                f_list.append(att.filename)
-            user_input += f"\n[System Info: 已收到上传文件: {', '.join(f_list)}]"
-
-        if user_input.strip():
-            await task.send_input(user_input)
-            await message.add_reaction("📥")
+    # 检查是否发送了结束命令
+    if user_input.lower() in ["/end", "结束", "bye", "再见"]:
+        if thread_id in active_tasks:
+            task = active_tasks[thread_id]
+            task.kill()
+            active_tasks.pop(thread_id, None)
+        if task_registry:
+            task_registry.update_status(thread_id, STATUS_COMPLETED)
+        await message.channel.send("👋 **会话已手动结束**")
+        await message.add_reaction("✅")
         return
 
-    # 已完成任务：检查是否可继续
+    # 活跃任务：进程仍在运行，提示用户等待
+    if thread_id in active_tasks:
+        task = active_tasks[thread_id]
+
+        if task.process is None or task.process.returncode is not None:
+            # 进程已确认退出，从活跃队列移除并走下方的重建对话逻辑
+            active_tasks.pop(thread_id, None)
+        else:
+            if message.attachments:
+                f_list = []
+                for att in message.attachments:
+                    save_path = Path(task.cwd) / att.filename
+                    await att.save(save_path)
+                    f_list.append(att.filename)
+                await message.channel.send(f"📎 文件已保存，任务完成后将可使用: {', '.join(f_list)}")
+            else:
+                await message.channel.send("⏳ 任务正在执行中，请等待完成后再继续输入。")
+            await message.add_reaction("⏳")
+            return
+
+    # 没有活跃任务，但检查是否有可继续的任务（waiting 或 completed 状态）
     if task_registry and task_registry.is_resumable(thread_id):
-        # 自动继续任务
         task_info = task_registry.get_task_by_thread(thread_id)
         parsed_data = task_info.get("parsed_data", {})
-        
-        # 构建继续的 prompt
-        continue_prompt = message.content
-        if continue_prompt.strip():
-            await message.channel.send("🔄 继续上一个任务...")
-            
-            # 使用保存的 parsed_data 重建 ParsedTask
-            from .parser import ParsedTask
-            parsed = ParsedTask(
-                task=continue_prompt,
-                repo=parsed_data.get("repo"),
-                workspace=parsed_data.get("workspace"),
-                is_file_operation=parsed_data.get("is_file_operation", False),
-            )
-            
-            await task_queue.put((message.channel, parsed, task_info["model"]))
-            await message.add_reaction("📥")
+        session_id = task_registry.get_session_id(thread_id)
+
+        if user_input:
+            await message.channel.send("🔄 继续对话...")
+            try:
+                from .parser import ParsedTask, _detect_file_operation
+                parsed = ParsedTask(
+                    task=user_input,
+                    repo=parsed_data.get("repo"),
+                    workspace=parsed_data.get("workspace"),
+                    is_file_operation=_detect_file_operation(user_input) or parsed_data.get("is_file_operation", False),
+                )
+                await task_queue.put((message.channel, parsed, task_info["model"], session_id, message.author.id))
+                await message.add_reaction("📥")
+            except discord.errors.HTTPException as e:
+                if e.code in (40072, 40025):  # Archived or locked thread
+                    await message.channel.send("⚠️ 此会话已归档/锁定，无法继续回复。请在频道使用 /task 开启新会话。")
+                    task_registry.update_status(thread_id, STATUS_COMPLETED)
+                else:
+                    raise
+            return
 
     await bot.process_commands(message)
 
