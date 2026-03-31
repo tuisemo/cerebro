@@ -5,9 +5,30 @@ Discord 消息速率限制器 (Rate Limiter)
 """
 
 import asyncio
+import logging
 import time
 from typing import Union
+import aiohttp
 import discord
+
+logger = logging.getLogger(__name__)
+
+
+async def _send_with_retry(coro_func, *args, max_retries=3, base_delay=0.5, **kwargs):
+    """Send a message with exponential backoff retry on connection errors."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return await coro_func(*args, **kwargs)
+        except (aiohttp.ClientConnectorError, ConnectionResetError, OSError) as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"Discord send failed (attempt {attempt+1}/{max_retries}), retrying in {delay}s: {e}")
+                await asyncio.sleep(delay)
+            else:
+                logger.error(f"Discord send failed after {max_retries} attempts: {e}")
+    raise last_error
 
 
 class MessageThrottle:
@@ -29,7 +50,9 @@ class MessageThrottle:
             if elapsed < self.MIN_INTERVAL:
                 await asyncio.sleep(self.MIN_INTERVAL - elapsed)
 
-            msg = await self.channel.send(content[:2000], **kwargs)
+            msg = await _send_with_retry(
+                self.channel.send, content[:2000], **kwargs
+            )
             self._last_send_time = time.monotonic()
             return msg
 
@@ -42,5 +65,7 @@ class MessageThrottle:
             if elapsed < self.MIN_INTERVAL:
                 await asyncio.sleep(self.MIN_INTERVAL - elapsed)
 
-            await message.edit(content=content[:2000], **kwargs)
+            await _send_with_retry(
+                message.edit, content=content[:2000], **kwargs
+            )
             self._last_send_time = time.monotonic()

@@ -152,8 +152,11 @@ cerebro/
 #### `runner.py` — Droid 进程控制
 
 - 动态查找 `droid` 可执行文件
-- 进程启动与参数构建
-- JSON 事件流解析
+- **双传输层架构**（Phase 3+）：
+  - `CliDroidTransport` — 启动 `droid exec` subprocess，解析 JSON 事件流
+  - `SdkDroidTransport` — 使用 `droid-sdk` Python 客户端，支持权限审批和 ask-user 回调
+  - `BaseDroidTransport` — 两者共享抽象基类
+- `InteractionBridge` 解耦 permission/ask-user 回调，允许接入任意交互层
 - Windows 环境适配（编码容错、Shell 提示注入）
 
 #### `workspace.py` — 工作区管理
@@ -209,7 +212,11 @@ task_worker (并发 Worker)
      ↓
 workspace.py (获取/创建工作区)
      ↓
-runner.py (启动 Droid 进程)
+runner.py
+ ├─ CliDroidTransport   (DROID_TRANSPORT=cli, 默认)
+ │   └─ subprocess "droid exec" + JSON 事件解析
+ └─ SdkDroidTransport   (DROID_TRANSPORT=sdk, Phase 3+)
+     └─ droid-sdk Python 客户端 + Discord 权限桥接
      ↓
 handler.py (事件流处理)
      ↓
@@ -256,6 +263,7 @@ droid_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 | `DISCORD_BOT_TOKEN` | ✅ | - | Discord Bot Token |
 | `FACTORY_API_KEY` | ❌ | - | Factory API Key |
 | `DEFAULT_MODEL` | ❌ | `custom:MiniMax-M2.7` | 默认 AI 模型 |
+| `DROID_TRANSPORT` | ❌ | `cli` | Droid 传输层：`cli`（默认subprocess）或 `sdk`（Python SDK客户端，Phase 3+）|
 | `WORKSPACES_DIR` | ❌ | `./droid_workspaces` | 工作区根目录 |
 | `MAX_CONCURRENT_TASKS` | ❌ | `2` | 并发任务上限 |
 
@@ -264,11 +272,12 @@ droid_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 ```toml
 [project]
 name = "cerebro"
-version = "2.0.0"
+version = "2.1.0"
 description = "Cerebro — 群体智能协同引擎"
 requires-python = ">=3.12"
 dependencies = [
     "discord.py>=2.3.0",
+    "droid-sdk>=0.1.2",        # Phase 3 SDK transport（可选，DROID_TRANSPORT=sdk 时需要）
     "python-dotenv>=1.0.0",
 ]
 
@@ -394,6 +403,16 @@ MIT License
 ---
 
 ## 更新日志
+
+> 详细更新记录请参阅 [CHANGELOG.md](./CHANGELOG.md)。
+
+### v2.1.0 — SDK Transport Pilot (Phase 3–4)
+- 新增 `DROID_TRANSPORT` 环境变量，支持 `sdk` 传输层（Python SDK 客户端）
+- SDK Permission Bridging：工具权限请求通过 Discord 按钮/通知交互审批
+- SDK ask-user Bridging：在 Discord Thread 内直接回复补充信息
+- 双传输层架构：`CliDroidTransport`（subprocess）+ `SdkDroidTransport`（Python SDK）
+- `InteractionBridge` 解耦 transport 与 Discord 交互逻辑
+- `flush_output()` 公开方法修复完成事件时的缓冲刷新
 
 ### v2.0.0
 - 支持多场景任务模式（repo/workspace/temp/qa）

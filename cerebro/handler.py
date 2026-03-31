@@ -90,9 +90,7 @@ class SmartApprovalHandler:
 
     async def notify_moderate(self, tool_name: str, cmd: str):
         """中等风险：发送通知，不等待"""
-        await self.throttle.send(
-            f"⚡ **即将执行指令:**\n```bash\n{cmd[:500]}\n```"
-        )
+        await self.throttle.send(f"⚡ `{tool_name}`: `{cmd[:200]}`")
 
     async def request_high_risk(self, tool_name: str, cmd: str) -> bool:
         """高危操作：阻塞等待用户确认"""
@@ -107,21 +105,149 @@ class SmartApprovalHandler:
 class DroidEventHandler:
     """将 Droid 事件映射为 Discord 对话输出"""
 
+    # Assistant text flush thresholds
+    ASSISTANT_FLUSH_CHARS = 1200
+    MAX_DISCORD_CHARS = 1950  # Discord limit minus safety margin
+
     def __init__(self, thread: discord.Thread, dashboard: TaskDashboard, requester_id: int = None):
         self.thread = thread
         self.dashboard = dashboard
         self._buffer = ""
+        self._thinking_buffer = ""
+        self._thinking_msg: discord.Message | None = None
+        self._thinking_messages: list[discord.Message] = []  # Track all thinking messages for cleanup
         self._last_msg: discord.Message | None = None
         self.throttle = MessageThrottle(thread)
         self.approval = SmartApprovalHandler(thread, self.throttle, requester_id=requester_id)
         self._last_flush_time = time.time()
+
+    def _chunk_text(self, text: str, max_chars: int = None) -> list[str]:
+        """Split text into chunks at natural boundaries, no truncation.
+        
+        Strategy:
+        1. Split on \\n\\n paragraphs first
+        2. If any paragraph > max_chars, split on \\n lines
+        3. If any line > max_chars, split on spaces (word wrap)
+        4. Return list of chunks, each <= max_chars
+        
+        Args:
+            text: The text to split
+            max_chars: Maximum characters per chunk (default: MAX_DISCORD_CHARS)
+        
+        Returns:
+            List of text chunks, each <= max_chars
+        """
+        if max_chars is None:
+            max_chars = self.MAX_DISCORD_CHARS
+        
+        if len(text) <= max_chars:
+            return [text] if text else []
+        
+        chunks = []
+        
+        # Step 1: Split on paragraph boundaries (\n\n)
+        paragraphs = text.split("\n\n")
+        
+        for paragraph in paragraphs:
+            if len(paragraph) <= max_chars:
+                # Paragraph fits, add it
+                chunks.append(paragraph)
+            else:
+                # Paragraph too big, try splitting on lines
+                lines = paragraph.split("\n")
+                current_chunk = ""
+                
+                for line in lines:
+                    if not line.strip():
+                        # Empty line - could be paragraph separator within a chunk
+                        if current_chunk and len(current_chunk) + 2 <= max_chars:
+                            current_chunk += "\n\n"
+                        continue
+                    
+                    line_len = len(line)
+                    
+                    if line_len <= max_chars:
+                        # Line fits, add it
+                        if current_chunk:
+                            # Add newline if we have content
+                            if len(current_chunk) + 1 + line_len <= max_chars:
+                                current_chunk += "\n" + line
+                            else:
+                                chunks.append(current_chunk)
+                                current_chunk = line
+                        else:
+                            current_chunk = line
+                    else:
+                        # Line too long - split on spaces (word wrap)
+                        words = line.split(" ")
+                        if current_chunk:
+                            chunks.append(current_chunk)
+                            current_chunk = ""
+                        
+                        for word in words:
+                            word_len = len(word)
+                            if not word:
+                                continue
+                            if word_len <= max_chars:
+                                if not current_chunk:
+                                    current_chunk = word
+                                elif len(current_chunk) + 1 + word_len <= max_chars:
+                                    current_chunk += " " + word
+                                else:
+                                    chunks.append(current_chunk)
+                                    current_chunk = word
+                            else:
+                                # Single word longer than max_chars - force split
+                                if current_chunk:
+                                    chunks.append(current_chunk)
+                                    current_chunk = ""
+                                # Split long word into chunks
+                                while len(word) > max_chars:
+                                    chunks.append(word[:max_chars])
+                                    word = word[max_chars:]
+                                if word:
+                                    current_chunk = word
+                
+                if current_chunk:
+                    chunks.append(current_chunk)
+        
+        # Merge tiny trailing chunks into previous chunks
+        if len(chunks) > 1:
+            merged_chunks = []
+            for i, chunk in enumerate(chunks):
+                if i > 0 and len(chunk) < 50 and merged_chunks:
+                    # Tiny trailing chunk - try to append to previous
+                    prev = merged_chunks[-1]
+                    if len(prev) + 2 + len(chunk) <= max_chars:
+                        merged_chunks[-1] = prev + "\n\n" + chunk
+                        continue
+                merged_chunks.append(chunk)
+            chunks = merged_chunks
+        
+        # Final pass: ensure all chunks are within limit
+        final_chunks = []
+        for chunk in chunks:
+            while len(chunk) > max_chars:
+                # Split at last space before max_chars
+                split_point = chunk.rfind(" ", 0, max_chars)
+                if split_point <= 0:
+                    # No space found, force split at max_chars
+                    split_point = max_chars
+                final_chunks.append(chunk[:split_point])
+                chunk = chunk[split_point:].lstrip()
+            if chunk:
+                final_chunks.append(chunk)
+        
+        return final_chunks
 
     async def handle(self, event: dict) -> bool:
         """处理单个事件。返回 False 表示流应终止。"""
         etype = event.get("type", "")
         logger.info(f"[HANDLER] type={etype} keys={list(event.keys())}")
 
-        if etype in ("assistant_chunk", "thinking"):
+        if etype == "thinking":
+            return await self._on_thinking(event)
+        elif etype == "assistant_chunk":
             return await self._on_assistant_text(event)
         elif etype == "message":
             return await self._on_message(event)
@@ -148,7 +274,71 @@ class DroidEventHandler:
             return await self._on_assistant_text(event)
         return True
 
+    async def _on_thinking(self, event: dict) -> bool:
+        """处理 thinking 事件 - 单独显示思考过程"""
+        text = event.get("text", event.get("content", ""))
+        if isinstance(text, dict):
+            text = text.get("content", text.get("text", ""))
+        text = str(text) if text else ""
+        
+        if text:
+            # Append to thinking buffer (no cap - let it grow)
+            self._thinking_buffer += text
+            await self._thinking_flush()
+            await self.dashboard.update(status="思考与回复中")
+        return True
+
+    async def _thinking_flush(self):
+        """发送思考消息（支持多消息分页显示思考进度）"""
+        if not self._thinking_buffer.strip():
+            return
+
+        # Calculate safe content size (header + code block wrapper overhead)
+        header_base = "🤔 **Droid 思考中...**"
+        code_wrapper = "\n```\n...\n```"
+        header_overhead = len(header_base) + len(code_wrapper)
+        safe_content = self.MAX_DISCORD_CHARS - header_overhead - 10  # Extra safety margin
+
+        # Chunk the thinking content
+        chunks = self._chunk_text(self._thinking_buffer, safe_content)
+        total_chunks = len(chunks)
+
+        try:
+            if total_chunks == 1:
+                # Single chunk that fits - send normally
+                content = f"{header_base}\n```\n{chunks[0]}\n```"
+                if self._thinking_msg is None:
+                    self._thinking_msg = await self.throttle.send(content)
+                else:
+                    await self._thinking_msg.edit(content=content)
+            else:
+                # Multiple chunks - send as separate messages showing progress
+                # First, clear old thinking messages if any
+                if self._thinking_messages:
+                    # Edit the first one to start fresh
+                    pass
+                
+                # Send all chunks as separate messages (they stack in Discord)
+                self._thinking_messages = []
+                for i, chunk in enumerate(chunks):
+                    if i == 0:
+                        header = f"🤔 **Droid 思考中...** (1/{total_chunks})"
+                    else:
+                        header = f"🤔 继续思考... ({i+1}/{total_chunks})"
+                    content = f"{header}\n```\n{chunk}\n```"
+                    msg = await self.throttle.send(content)
+                    self._thinking_messages.append(msg)
+                
+                # Keep reference to last message for potential editing
+                self._thinking_msg = self._thinking_messages[-1] if self._thinking_messages else None
+                
+        except Exception as e:
+            logger.warning(f"[_thinking_flush] failed: {e}")
+            self._thinking_msg = None
+            self._thinking_messages = []
+
     async def _on_assistant_text(self, event: dict) -> bool:
+        """处理 assistant_chunk 事件 - 使用智能 chunking"""
         # 兼容不同模型或事件类型的字段：text 或 content 或 delta
         text = event.get("text", event.get("content", event.get("delta", "")))
         if isinstance(text, dict):
@@ -158,14 +348,11 @@ class DroidEventHandler:
         text = str(text) if text else ""
         if text:
             self._buffer += text
-            current_time = time.time()
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[TEXT] buffer_len=%d text_len=%d will_flush=%s", len(self._buffer), len(text), len(text) > 10 or "\n" in text or len(self._buffer) > 50 or (current_time - self._last_flush_time) > 2.0)
-            # 降低 flush 阈值：短消息或换行符触发，或 buffer 超过阈值，或超过时间阈值
-            if len(text) > 10 or "\n" in text or len(self._buffer) > 50 or (current_time - self._last_flush_time) > 2.0:
+            # Flush conditions: buffer reaches 1200 chars OR explicitly flushed
+            # The _flush() method now uses intelligent chunking
+            if len(self._buffer) >= self.ASSISTANT_FLUSH_CHARS:
                 await self._flush()
-                self._last_flush_time = current_time
-                await self.dashboard.update(status="🧠 正在思考与回复...")
+                await self.dashboard.update(status="思考与回复中")
         return True
 
     async def _on_tool_call(self, event: dict) -> bool:
@@ -173,99 +360,109 @@ class DroidEventHandler:
         tool_id = event.get("toolId", "unknown")
         tool_name = event.get("toolName", tool_id)
 
-        status_msg = f"🔍 **Droid 正在尝试使用工具:** `{tool_name}`"
         if tool_name in ["Execute", "execute_command"]:
             cmd_detail = event.get("parameters", {}).get("command", "")
             cmd_safe = cmd_detail[:500].replace("```", "`` `")
-            status_msg = f"⚙️ **正在执行指令:**\n```bash\n{cmd_safe}\n```"
             
             # 智能确认机制
             if self.approval.is_high_risk(cmd_detail):
                 # 高危命令：阻塞等待确认
-                await self.dashboard.update(status=f"⚠️ 等待高危操作确认...")
+                await self.dashboard.update(status="⛔ 高危确认")
                 approved = await self.approval.request_high_risk(tool_name, cmd_detail)
                 if not approved:
-                    await self.throttle.send(f"🚫 用户拒绝执行，任务终止")
                     return False
             elif tool_name in MODERATE_RISK_TOOLS:
                 # 中等风险：通知后自动继续
                 await self.approval.notify_moderate(tool_name, cmd_detail)
-                
         elif tool_name in ["Create", "Edit", "write_file"]:
             file_path = event.get("parameters", {}).get("file_path", "文件")
-            status_msg = f"📝 **正在修改文件:** `{os.path.basename(file_path)}`"
+            await self.dashboard.update(status="📝 修改中", tool_name=tool_name)
+            return True
 
-        await self.dashboard.update(status=f"⚙️ 执行中: {tool_name}")
-        await self.throttle.send(status_msg)
+        await self.dashboard.update(status="🔧 执行中", tool_name=tool_name)
         return True
 
     async def _on_tool_result(self, event: dict) -> bool:
-        tool_id = event.get("toolId", "unknown")
-        tool_name = event.get("toolName", tool_id)
+        tool_name = event.get("toolName", "tool")
         is_error = event.get("isError", False)
-
-        emoji = "❌" if is_error else "✅"
         raw_result = str(event.get("value", event.get("result", "")))
-        truncated = len(raw_result) > 1000
-        result_preview = raw_result[:1000]
 
-        if result_preview.strip():
-            suffix = "\n> *(已截断，完整结果见工作区)*" if truncated else ""
-            safe_result = result_preview.replace("```", "`` `")
-            await self.throttle.send(f"{emoji} **{tool_name} 执行反馈:**\n```\n{safe_result}\n```{suffix}")
+        if raw_result.strip():
+            chunks = self._chunk_text(raw_result)
+            for chunk in chunks:
+                safe = chunk.replace("```", "`` `")[:1950]
+                emoji = "❌" if is_error else "✅"
+                await self.throttle.send(f"{emoji} `{tool_name}`: `{safe[:200]}`")
 
-        await self.dashboard.update(status="✅ 工具调用完成")
+        await self.dashboard.update(status="✅ 完成", tool_name=tool_name)
         return True
 
     async def _on_completion(self, event: dict) -> bool:
-        await self._flush()
-        # 发送任务完成确认消息
-        await self.throttle.send("✅ **任务执行完成**")
-        await self.dashboard.update(status="⏳ 等待用户继续输入...")
-        # 返回 False 让事件循环正常结束，进程会退出
-        # 但 session 保持活跃状态，后续通过新进程继续对话
+        await self.flush_output()
+        await self.dashboard.update(status="💬 继续输入")
         return False
 
     async def _on_error(self, event: dict) -> bool:
-        await self._flush()
+        await self.flush_output()
         error_msg = event.get("text", event.get("message", "未知错误"))
         await self.dashboard.error(error_msg[:800])
-        safe_err = error_msg[:1900].replace("```", "`` `")
-        await self.throttle.send(f"❌ **运行中止:** {safe_err}")
         return False
 
     async def _flush(self):
-        """将缓冲文本发送到 Discord (受节流器保护)，支持超长内容分页"""
+        """Flush buffer using intelligent chunking - no truncation"""
         if not self._buffer.strip():
             return
 
-        chunk = self._buffer[:2000]
-        remainder = self._buffer[2000:]
-        logger.info(f"[FLUSH] sending len={len(chunk)} remainder={len(remainder)} has_last_msg={self._last_msg is not None}")
+        # Use _chunk_text to split at natural boundaries
+        chunks = self._chunk_text(self._buffer)
+        
+        logger.info(f"[FLUSH] sending {len(chunks)} chunks")
 
-        send_success = False
-        # 只有在没有后续内容时才尝试 edit（避免覆盖已发出的消息）
-        if self._last_msg and not remainder:
-            try:
-                await self.throttle.edit(self._last_msg, content=chunk)
-                send_success = True
-            except Exception as e:
-                logger.warning(f"[_flush] edit failed: {e}")
-                self._last_msg = None
-
-        if not send_success:
-            try:
+        try:
+            for i, chunk in enumerate(chunks):
                 self._last_msg = await self.throttle.send(chunk)
-                send_success = True
-            except Exception as e:
-                logger.error(f"[_flush] send failed: {e}")
-
-        if not send_success:
-            return
-
-        # 即使发送成功也要清理 buffer；失败则静默丢弃（下次 flush 重试）
-        self._buffer = remainder
-        self._last_flush_time = time.time()
-        # 有剩余内容时强制下次发新消息，避免覆盖已发出的分页
-        if remainder:
+                logger.info(f"[FLUSH] sent chunk {i+1}/{len(chunks)} len={len(chunk)}")
+        except Exception as e:
+            logger.error(f"[_flush] send failed: {e}")
             self._last_msg = None
+
+        self._buffer = ""
+        self._last_flush_time = time.time()
+
+    async def flush_output(self):
+        """Final flush for any pending text, then clear thinking buffer"""
+        await self._flush()
+        # Clear thinking buffer - edit message to indicate done
+        await self._clear_thinking()
+
+    async def _clear_thinking(self):
+        """Clear thinking state - edit last message to show completion.
+        
+        Note: We cannot delete Discord messages without special permissions,
+        so multiple thinking messages will remain visible (showing progressive
+        thinking output). The last one gets edited to show completion.
+        """
+        if self._thinking_buffer:
+            # Edit the last thinking message to show completion
+            if self._thinking_msg is not None:
+                try:
+                    # Use _chunk_text to get the final content (no truncation)
+                    header = "🤔 **Droid 思考完成**"
+                    code_wrapper = "\n```\n...\n```"
+                    overhead = len(header) + len(code_wrapper) + 10
+                    safe_content = self.MAX_DISCORD_CHARS - overhead
+                    
+                    chunks = self._chunk_text(self._thinking_buffer, safe_content)
+                    if len(chunks) == 1:
+                        formatted = f"{header}\n```\n{chunks[0]}\n```"
+                    else:
+                        # Multiple chunks - just show first chunk with indicator
+                        formatted = f"{header} (内容较长，已分{len(chunks)}段显示)\n```\n{chunks[0]}\n```"
+                    await self._thinking_msg.edit(content=formatted)
+                except Exception as e:
+                    logger.warning(f"[_clear_thinking] edit failed: {e}")
+        
+        # Clear all thinking state
+        self._thinking_buffer = ""
+        self._thinking_msg = None
+        self._thinking_messages = []

@@ -150,8 +150,11 @@ cerebro/
 #### `runner.py` — Droid Process Control
 
 - Dynamically locate `droid` executable
-- Process startup and parameter building
-- JSON event stream parsing
+- **Dual-transport architecture** (Phase 3+):
+  - `CliDroidTransport` — spawns `droid exec` subprocess, parses JSON event stream
+  - `SdkDroidTransport` — uses `droid-sdk` Python client, supports permission and ask-user callbacks
+  - `BaseDroidTransport` — shared abstract base for both transports
+- `InteractionBridge` decouples permission/ask-user callbacks, allowing any interaction layer to be plugged in
 - Windows environment adaptation (encoding tolerance, shell prompt injection)
 
 #### `workspace.py` — Workspace Management
@@ -207,7 +210,11 @@ task_worker (concurrent worker)
      ↓
 workspace.py (get/create workspace)
      ↓
-runner.py (launch Droid process)
+runner.py
+ ├─ CliDroidTransport   (DROID_TRANSPORT=cli, default)
+ │   └─ subprocess "droid exec" + JSON event parsing
+ └─ SdkDroidTransport   (DROID_TRANSPORT=sdk, Phase 3+)
+     └─ droid-sdk Python client + Discord permission bridging
      ↓
 handler.py (event stream processing)
      ↓
@@ -254,6 +261,7 @@ Each Thread ID corresponds to an independent workspace:
 | `DISCORD_BOT_TOKEN` | ✅ | - | Discord Bot Token |
 | `FACTORY_API_KEY` | ❌ | - | Factory API Key |
 | `DEFAULT_MODEL` | ❌ | `custom:MiniMax-M2.7` | Default AI Model |
+| `DROID_TRANSPORT` | ❌ | `cli` | Droid transport layer: `cli` (subprocess, default) or `sdk` (Python SDK client, Phase 3+) |
 | `WORKSPACES_DIR` | ❌ | `./droid_workspaces` | Workspace root directory |
 | `MAX_CONCURRENT_TASKS` | ❌ | `2` | Concurrent task limit |
 
@@ -262,11 +270,12 @@ Each Thread ID corresponds to an independent workspace:
 ```toml
 [project]
 name = "cerebro"
-version = "2.0.0"
+version = "2.1.0"
 description = "Cerebro — Swarm Intelligence Collaboration Engine"
 requires-python = ">=3.12"
 dependencies = [
     "discord.py>=2.3.0",
+    "droid-sdk>=0.1.2",        # Phase 3 SDK transport (optional, required when DROID_TRANSPORT=sdk)
     "python-dotenv>=1.0.0",
 ]
 
@@ -392,6 +401,16 @@ MIT License
 ---
 
 ## Changelog
+
+> Full changelog available at [CHANGELOG.md](./CHANGELOG.md).
+
+### v2.1.0 — SDK Transport Pilot (Phase 3–4)
+- New `DROID_TRANSPORT` environment variable, supporting `sdk` transport layer (Python SDK client)
+- SDK Permission Bridging: tool permission requests approved via Discord button/notification interactions
+- SDK ask-user Bridging: supplementary information requested directly in Discord Thread replies
+- Dual-transport architecture: `CliDroidTransport` (subprocess) + `SdkDroidTransport` (Python SDK)
+- `InteractionBridge` decouples transport from Discord interaction logic
+- `flush_output()` public method fixes buffer flushing on completion events
 
 ### v2.0.0
 - Added multi-scenario task modes (repo/workspace/temp/qa)

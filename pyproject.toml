@@ -1,11 +1,12 @@
 [project]
 name = "cerebro"
-version = "2.0.0"
+version = "2.1.0"
 description = "Cerebro — 群体智能协同引擎"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "discord.py>=2.3.0",
+    "droid-sdk>=0.1.2",
     "python-dotenv>=1.0.0",
 ]
 
@@ -14,3 +15,6 @@ cerebro = "cerebro.app:main"
 
 [tool.uv]
 package = true
+
+[tool.setuptools]
+packages = ["cerebro"]

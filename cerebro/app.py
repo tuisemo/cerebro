@@ -10,6 +10,7 @@ import os
 import io
 import logging
 from datetime import datetime
+from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from .runner import DroidTask
+from .runner import DroidTask, InteractionBridge, get_droid_transport_name
 from .workspace import WorkspaceManager, WorkspaceError
 from .ui import TaskDashboard
 from .handler import DroidEventHandler
@@ -79,6 +80,7 @@ WORKSPACES_DIR = os.getenv("WORKSPACES_DIR", "./droid_workspaces")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "custom:MiniMax-M2.7")
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_TASKS", "2"))
 TASK_TIMEOUT_MINUTES = int(os.getenv("TASK_TIMEOUT_MINUTES", "10"))  # 任务超时时间（分钟）
+DROID_TRANSPORT = get_droid_transport_name()
 
 if API_KEY:
     os.environ["FACTORY_API_KEY"] = API_KEY
@@ -96,6 +98,162 @@ workspace_mgr: Optional[WorkspaceManager] = None
 task_registry: Optional[TaskRegistry] = None
 active_tasks: dict[int, DroidTask] = {}
 task_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+
+
+@dataclass
+class PendingAskUserRequest:
+    task: DroidTask
+    requester_id: Optional[int]
+    prompt_message: Optional[discord.Message] = None
+    future: Optional[asyncio.Future] = None
+    params: Optional[dict] = None
+
+
+pending_ask_user_requests: dict[int, PendingAskUserRequest] = {}
+
+
+def _select_transport_for_task(parsed, session_id=None) -> tuple[str, Optional[str]]:
+    """
+    Select the Cerebro transport for a task using a conservative policy.
+
+    Phase 3 policy (DROID_TRANSPORT=sdk):
+      - Fresh, non-file-operation tasks  -> SDK (interactive + permission bridging)
+      - Resumed sessions (session_id set) -> CLI (SDK load_session does not re-apply
+        model/autonomy settings; CLI preserves existing session behaviour)
+      - File-operation tasks               -> CLI (approval UX depends on CLI event shape)
+
+    SDK resume is intentionally gated on CLI because load_session() restores a session
+    with whatever model/effort was active when it was first initialised — not the
+    model's currently configured value.  Unlocking SDK resume safely requires a
+    separate SDK-side "re-initialise" or "override settings" API that does not yet
+    exist, so we keep resume on the stable CLI path.
+    """
+    requested_transport = DROID_TRANSPORT
+    if requested_transport != "sdk":
+        return requested_transport, None
+
+    if session_id:
+        return "cli", "resume requires current CLI session behavior"
+
+    if parsed.is_file_operation:
+        return "cli", "file-operation tasks require current CLI approval behavior"
+
+    return "sdk", None
+
+
+def _task_is_running(task: DroidTask) -> bool:
+    return task.is_running
+
+
+def _normalize_permission_result(result: dict) -> dict:
+    selected_option = result.get("selected_option") or result.get("selectedOption") or "cancel"
+    return {"selected_option": str(selected_option)}
+
+
+def _normalize_ask_user_result(result: dict) -> dict:
+    return {
+        "cancelled": bool(result.get("cancelled", False)),
+        "answers": list(result.get("answers", [])),
+    }
+
+
+async def _request_sdk_permission(
+    thread: discord.Thread,
+    handler: DroidEventHandler,
+    params: dict,
+) -> dict:
+    tool_uses = params.get("toolUses") or params.get("tool_uses") or []
+    if not tool_uses:
+        raise RuntimeError("SDK 权限请求缺少 toolUses，已安全终止。")
+
+    primary_tool = tool_uses[0] or {}
+    tool_use = primary_tool.get("toolUse") or primary_tool.get("tool_use") or {}
+    tool_name = tool_use.get("name") or primary_tool.get("toolName") or "tool"
+    tool_input = tool_use.get("input") or primary_tool.get("parameters") or {}
+    command = ""
+    if isinstance(tool_input, dict):
+        command = str(tool_input.get("command", ""))
+
+    await handler.flush_output()
+    await handler.dashboard.update(status="⚠️ 等待权限审批...")
+
+    if command and handler.approval.is_high_risk(command):
+        approved = await handler.approval.request_high_risk(tool_name, command)
+        if not approved:
+            await thread.send("🚫 **已拒绝该权限请求，任务将安全终止。**")
+            return {"selected_option": "cancel"}
+    elif command:
+        await handler.approval.notify_moderate(tool_name, command)
+    else:
+        approved = await handler.approval.request_high_risk(
+            tool_name,
+            f"{tool_name} (no command details provided)",
+        )
+        if not approved:
+            await thread.send("🚫 **已拒绝该权限请求，任务将安全终止。**")
+            return {"selected_option": "cancel"}
+
+    options = params.get("options") or []
+    option_values = {
+        str(option.get("value"))
+        for option in options
+        if isinstance(option, dict) and option.get("value")
+    }
+    if "proceed_once" not in option_values:
+        await thread.send("⚠️ **权限请求缺少安全的单次授权选项，已拒绝执行。**")
+        return {"selected_option": "cancel"}
+
+    return {"selected_option": "proceed_once"}
+
+
+async def _request_sdk_ask_user(
+    thread: discord.Thread,
+    task: DroidTask,
+    requester_id: Optional[int],
+    params: dict,
+) -> dict:
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+
+    questions = params.get("questions") or []
+    if not questions:
+        raise RuntimeError("SDK ask-user 请求缺少 questions，已安全终止。")
+
+    lines = ["❓ **Droid 需要你的补充信息才能继续：**"]
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+        index = question.get("index", "?")
+        text = question.get("question", "")
+        topic = question.get("topic", "")
+        suffix = f"（{topic}）" if topic else ""
+        lines.append(f"{index}. {text}{suffix}")
+        options = question.get("options") or []
+        if options:
+            lines.append(f"   可选项: {', '.join(str(opt) for opt in options[:10])}")
+    if len(questions) > 1:
+        lines.append("⚠️ 当前仅支持单问题直接回复；多问题请求将安全拒绝，请让 Droid 改为逐条提问。")
+    else:
+        lines.append("请直接在当前线程回复；回复后任务会继续。")
+
+    prompt_message = await thread.send("\n".join(lines))
+    if len(questions) > 1:
+        return {"cancelled": True, "answers": []}
+
+    pending_ask_user_requests[thread.id] = PendingAskUserRequest(
+        task=task,
+        requester_id=requester_id,
+        prompt_message=prompt_message,
+        future=future,
+        params=params,
+    )
+
+    try:
+        return _normalize_ask_user_result(await future)
+    finally:
+        current = pending_ask_user_requests.get(thread.id)
+        if current and current.future is future:
+            pending_ask_user_requests.pop(thread.id, None)
 
 
 # ============================================================================
@@ -171,6 +329,8 @@ async def _execute(thread: discord.Thread, prompt: str, model: str, parsed=None,
             session_id=session_id
         )
 
+    task = None
+
     try:
         # 获取工作区
         if parsed.repo or parsed.workspace:
@@ -208,9 +368,26 @@ async def _execute(thread: discord.Thread, prompt: str, model: str, parsed=None,
         workspace_info = format_task_preview(parsed)
         await thread.send(f"📋 **任务模式:** {workspace_info}")
 
-        task = DroidTask(cwd=isolated_cwd)
-        active_tasks[thread.id] = task
+        selected_transport, fallback_reason = _select_transport_for_task(parsed, session_id=session_id)
+        if fallback_reason:
+            logger.info(
+                "↩️ Thread %s falling back to cli transport: %s (requested=%s)",
+                thread.id,
+                fallback_reason,
+                DROID_TRANSPORT,
+            )
+
         handler = DroidEventHandler(thread, dashboard, requester_id=requester_id)
+        task = DroidTask(
+            cwd=isolated_cwd,
+            transport_name=selected_transport,
+        )
+        if selected_transport == "sdk":
+            task.transport.interaction_bridge = InteractionBridge(
+                request_permission=lambda params: _request_sdk_permission(thread, handler, params),
+                ask_user=lambda params: _request_sdk_ask_user(thread, task, requester_id, params),
+            )
+        active_tasks[thread.id] = task
 
         # 主事件循环 - 处理 Droid 输出
         async for event in task.run(parsed.task, model=model, session_id=session_id):
@@ -253,10 +430,13 @@ async def _execute(thread: discord.Thread, prompt: str, model: str, parsed=None,
         await thread.send(f"❌ **任务执行失败:** {str(e)[:1900]}")
 
     finally:
+        pending_ask_user_requests.pop(thread.id, None)
         # 延迟清理活跃任务记录，防止过早清理导致用户连续输入无法走 send_input
         def _delayed_cleanup():
-            task = active_tasks.get(thread.id)
-            if task and (task.process is None or task.process.returncode is not None):
+            if task is None:
+                return
+            current_task = active_tasks.get(thread.id)
+            if current_task is task and not _task_is_running(current_task):
                 active_tasks.pop(thread.id, None)
         
         bot.loop.call_later(30.0, _delayed_cleanup)
@@ -275,6 +455,13 @@ async def on_ready():
     try:
         workspace_mgr = WorkspaceManager(workspaces_dir=WORKSPACES_DIR)
         task_registry = TaskRegistry()
+
+        if DROID_TRANSPORT == "sdk":
+            logger.warning(
+                "⚠️ DROID_TRANSPORT=sdk 已启用：仅新鲜非文件任务走 SDK，"
+                "权限审批 / ask-user 通过 Discord 桥接处理；"
+                "恢复会话和文件操作任务继续走 CLI。"
+            )
 
         # 重置上次运行遗留的 active 任务（进程已不存在）
         stale_active = task_registry.get_active_tasks()
@@ -424,7 +611,42 @@ async def on_message(message: discord.Message):
     if thread_id in active_tasks:
         task = active_tasks[thread_id]
 
-        if task.process is None or task.process.returncode is not None:
+        pending_ask = pending_ask_user_requests.get(thread_id)
+        if pending_ask and pending_ask.task is task and task.is_running:
+            if pending_ask.requester_id and message.author.id != pending_ask.requester_id:
+                await message.channel.send("⚠️ 当前 ask-user 仅接受任务发起人的回复。")
+                await message.add_reaction("⛔")
+                return
+
+            questions = (pending_ask.params or {}).get("questions") or []
+            answers = []
+            for question in questions:
+                if not isinstance(question, dict):
+                    continue
+                answers.append({
+                    "index": question.get("index", len(answers) + 1),
+                    "question": question.get("question", ""),
+                    "answer": user_input,
+                })
+
+            if not answers:
+                answers = [{"index": 1, "question": "", "answer": user_input}]
+
+            if pending_ask.prompt_message:
+                try:
+                    await pending_ask.prompt_message.reply("✅ 已收到你的补充信息，任务继续执行中。")
+                except Exception:
+                    await message.channel.send("✅ 已收到你的补充信息，任务继续执行中。")
+            else:
+                await message.channel.send("✅ 已收到你的补充信息，任务继续执行中。")
+
+            if pending_ask.future and not pending_ask.future.done():
+                pending_ask.future.set_result({"cancelled": False, "answers": answers})
+            pending_ask_user_requests.pop(thread_id, None)
+            await message.add_reaction("✅")
+            return
+
+        if not _task_is_running(task):
             # 进程已确认退出，从活跃队列移除并走下方的重建对话逻辑
             active_tasks.pop(thread_id, None)
         else:
