@@ -9,7 +9,7 @@ import asyncio
 import os
 import io
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
@@ -110,6 +110,187 @@ class PendingAskUserRequest:
 
 
 pending_ask_user_requests: dict[int, PendingAskUserRequest] = {}
+
+BACKGROUND_TASKS: dict[str, asyncio.Task] = {}
+BOT_INIT_LOCK = asyncio.Lock()
+bot_runtime_initialized = False
+bot_ready_once = False
+discord_health_degraded_since: Optional[datetime] = None
+discord_recovery_lock = asyncio.Lock()
+
+HEALTH_CHECK_INTERVAL_SECONDS = 30
+HEALTH_CHECK_UNHEALTHY_AFTER_SECONDS = 90
+HEALTH_CHECK_RECOVERY_COOLDOWN_SECONDS = 180
+_last_health_recovery_at: Optional[datetime] = None
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _seconds_since(moment: Optional[datetime]) -> float:
+    if moment is None:
+        return 0.0
+    return (_utcnow() - moment).total_seconds()
+
+
+def _discord_connection_is_healthy() -> bool:
+    ws = getattr(bot, "ws", None)
+    if not bot.is_ready() or bot.is_closed() or ws is None:
+        return False
+
+    try:
+        ws_open = getattr(ws, "open", None)
+        if isinstance(ws_open, bool):
+            return ws_open
+        if callable(ws_open):
+            return bool(ws_open())
+
+        socket = getattr(ws, "socket", None)
+        if socket is not None:
+            socket_closed = getattr(socket, "closed", None)
+            if isinstance(socket_closed, bool):
+                return not socket_closed
+            if callable(socket_closed):
+                return not bool(socket_closed())
+    except Exception:
+        logger.exception("❌ Discord 健康检查读取 websocket 状态失败")
+        return False
+
+    return False
+
+
+def _track_background_task(name: str, task: asyncio.Task) -> asyncio.Task:
+    existing = BACKGROUND_TASKS.get(name)
+    if existing and not existing.done():
+        return existing
+
+    BACKGROUND_TASKS[name] = task
+
+    def _cleanup(completed: asyncio.Task, task_name: str = name) -> None:
+        current = BACKGROUND_TASKS.get(task_name)
+        if current is completed:
+            BACKGROUND_TASKS.pop(task_name, None)
+        try:
+            completed.result()
+        except asyncio.CancelledError:
+            logger.info("🛑 后台任务已取消: %s", task_name)
+        except Exception:
+            logger.exception("❌ 后台任务异常退出: %s", task_name)
+
+    task.add_done_callback(_cleanup)
+    return task
+
+
+async def _ensure_runtime_initialized() -> None:
+    global workspace_mgr, task_registry, bot_runtime_initialized
+
+    async with BOT_INIT_LOCK:
+        if bot_runtime_initialized:
+            return
+
+        workspace_mgr = WorkspaceManager(workspaces_dir=WORKSPACES_DIR)
+        task_registry = TaskRegistry()
+
+        if DROID_TRANSPORT == "sdk":
+            logger.warning(
+                "⚠️ DROID_TRANSPORT=sdk 已启用：仅新鲜非文件任务走 SDK，"
+                "权限审批 / ask-user 通过 Discord 桥接处理；"
+                "恢复会话和文件操作任务继续走 CLI。"
+            )
+
+        stale_active = task_registry.get_active_tasks()
+        for t in stale_active:
+            task_registry.update_status(t["thread_id"], STATUS_WAITING)
+        if stale_active:
+            logger.info("🔁 重置 %s 个遗留 active 任务为 waiting", len(stale_active))
+
+        _track_background_task(
+            "auto_cleanup_loop",
+            bot.loop.create_task(workspace_mgr.auto_cleanup_loop(task_registry)),
+        )
+        for index in range(MAX_CONCURRENT):
+            _track_background_task(
+                f"task_worker_{index}",
+                bot.loop.create_task(task_worker()),
+            )
+        _track_background_task(
+            "discord_health_watchdog",
+            bot.loop.create_task(discord_health_watchdog()),
+        )
+
+        bot_runtime_initialized = True
+        logger.info("📁 系统初始化完成 (Workers: %s, 工作区: %s)", MAX_CONCURRENT, WORKSPACES_DIR)
+
+
+async def _attempt_discord_recovery(reason: str) -> bool:
+    global _last_health_recovery_at
+
+    async with discord_recovery_lock:
+        if bot.is_closed():
+            logger.warning("⚠️ 跳过 Discord 自愈：bot 已关闭 (%s)", reason)
+            return False
+
+        if _last_health_recovery_at and _seconds_since(_last_health_recovery_at) < HEALTH_CHECK_RECOVERY_COOLDOWN_SECONDS:
+            logger.warning(
+                "⏳ 跳过 Discord 自愈：距上次恢复仅 %.0fs (%s)",
+                _seconds_since(_last_health_recovery_at),
+                reason,
+            )
+            return False
+
+        ws = getattr(bot, "ws", None)
+        if not _discord_connection_is_healthy():
+            logger.warning("🔄 Discord 健康检查触发关闭连接，等待 discord.py 自动重连: %s", reason)
+        else:
+            logger.warning("🔄 Discord 健康检查主动关闭网关连接以触发重连: %s", reason)
+
+        _last_health_recovery_at = _utcnow()
+        try:
+            await bot.close()
+        except Exception:
+            logger.exception("❌ Discord 自愈关闭客户端失败")
+            return False
+
+        logger.warning("♻️ Discord 客户端已关闭，准备由外层 supervisor 重新启动")
+        return True
+
+
+async def discord_health_watchdog():
+    global discord_health_degraded_since
+
+    logger.info(
+        "🩺 Discord 健康检查已启动 (interval=%ss, unhealthy_after=%ss)",
+        HEALTH_CHECK_INTERVAL_SECONDS,
+        HEALTH_CHECK_UNHEALTHY_AFTER_SECONDS,
+    )
+
+    while not bot.is_closed():
+        healthy = _discord_connection_is_healthy()
+        if healthy:
+            if discord_health_degraded_since is not None:
+                logger.info(
+                    "✅ Discord 连接恢复健康，累计降级 %.1fs",
+                    _seconds_since(discord_health_degraded_since),
+                )
+                discord_health_degraded_since = None
+            else:
+                logger.debug("✅ Discord 健康检查正常")
+        else:
+            if discord_health_degraded_since is None:
+                discord_health_degraded_since = _utcnow()
+                logger.warning("⚠️ Discord 健康检查检测到连接降级，开始计时")
+            else:
+                degraded_for = _seconds_since(discord_health_degraded_since)
+                logger.warning("⚠️ Discord 连接仍未就绪/已断开，已持续 %.1fs", degraded_for)
+                if degraded_for >= HEALTH_CHECK_UNHEALTHY_AFTER_SECONDS:
+                    recovered = await _attempt_discord_recovery(
+                        f"unhealthy for {degraded_for:.1f}s"
+                    )
+                    if recovered:
+                        return
+
+        await asyncio.sleep(HEALTH_CHECK_INTERVAL_SECONDS)
 
 
 def _select_transport_for_task(parsed, session_id=None) -> tuple[str, Optional[str]]:
@@ -448,43 +629,50 @@ async def _execute(thread: discord.Thread, prompt: str, model: str, parsed=None,
 
 @bot.event
 async def on_ready():
-    global workspace_mgr, task_registry
+    global bot_ready_once, discord_health_degraded_since
 
-    logger.info(f"✅ 已连接: {bot.user}")
+    logger.info("✅ 已连接: %s", bot.user)
 
     try:
-        workspace_mgr = WorkspaceManager(workspaces_dir=WORKSPACES_DIR)
-        task_registry = TaskRegistry()
-
-        if DROID_TRANSPORT == "sdk":
-            logger.warning(
-                "⚠️ DROID_TRANSPORT=sdk 已启用：仅新鲜非文件任务走 SDK，"
-                "权限审批 / ask-user 通过 Discord 桥接处理；"
-                "恢复会话和文件操作任务继续走 CLI。"
-            )
-
-        # 重置上次运行遗留的 active 任务（进程已不存在）
-        stale_active = task_registry.get_active_tasks()
-        for t in stale_active:
-            task_registry.update_status(t["thread_id"], STATUS_WAITING)
-        if stale_active:
-            logger.info(f"🔁 重置 {len(stale_active)} 个遗留 active 任务为 waiting")
-
-        bot.loop.create_task(workspace_mgr.auto_cleanup_loop(task_registry))
-        for _ in range(MAX_CONCURRENT):
-            bot.loop.create_task(task_worker())
-
-        logger.info(f"📁 系统就绪 (Workers: {MAX_CONCURRENT}, 工作区: {WORKSPACES_DIR})")
+        await _ensure_runtime_initialized()
     except Exception as e:
         logger.error(f"初始化失败: {e}")
         await bot.close()
         return
+
+    if bot_ready_once:
+        logger.info("🔁 Discord 会话已恢复，跳过重复后台初始化")
+    else:
+        bot_ready_once = True
+        logger.info("🚀 Discord 首次 ready 完成")
+
+    discord_health_degraded_since = None
 
     try:
         synced = await bot.tree.sync()
         logger.info(f"🔄 同步 {len(synced)} 命令")
     except Exception as e:
         logger.error(f"命令同步失败: {e}")
+
+
+@bot.event
+async def on_connect():
+    logger.info("🔌 Discord 网关连接已建立")
+
+
+@bot.event
+async def on_disconnect():
+    global discord_health_degraded_since
+    if discord_health_degraded_since is None:
+        discord_health_degraded_since = _utcnow()
+    logger.warning("📴 Discord 网关连接断开，等待库内建重连")
+
+
+@bot.event
+async def on_resumed():
+    global discord_health_degraded_since
+    discord_health_degraded_since = None
+    logger.info("🔄 Discord 会话已恢复 (RESUMED)")
 
 
 # ============================================================================
@@ -695,12 +883,41 @@ async def on_message(message: discord.Message):
 # 入口
 # ============================================================================
 
+async def _run_bot_supervisor():
+    restart_delay_seconds = 5
+
+    while True:
+        try:
+            await bot.start(TOKEN)
+        except KeyboardInterrupt:
+            logger.info("🛑 收到退出信号，正在停止 Cerebro")
+            raise
+        except Exception:
+            logger.exception("❌ Discord 客户端异常退出，%ss 后尝试重启", restart_delay_seconds)
+            if bot.is_closed():
+                bot.clear()
+            await asyncio.sleep(restart_delay_seconds)
+            continue
+
+        if bot.is_closed():
+            logger.warning("♻️ Discord 客户端已关闭，%ss 后由 supervisor 重启", restart_delay_seconds)
+            bot.clear()
+            await asyncio.sleep(restart_delay_seconds)
+            continue
+
+        logger.info("🛑 Discord 客户端已停止，supervisor 即将退出")
+        return
+
+
 def main():
     if not TOKEN:
         logger.error("❌ 未发现 DISCORD_BOT_TOKEN")
         return
     logger.info("🚀 启动 Cerebro 引擎…")
-    bot.run(TOKEN, log_level=logging.WARNING)
+    try:
+        asyncio.run(_run_bot_supervisor())
+    except KeyboardInterrupt:
+        logger.info("👋 Cerebro 已停止")
 
 
 if __name__ == "__main__":
